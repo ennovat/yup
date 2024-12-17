@@ -1,13 +1,16 @@
-// @ts-ignore
-import cloneDeep from 'nanoclone';
-
 import { mixed as locale } from './locale';
-import Condition, { ConditionOptions, ResolveOptions } from './Condition';
-import runTests from './util/runTests';
+import Condition, {
+  ConditionBuilder,
+  ConditionConfig,
+  ResolveOptions,
+} from './Condition';
 import createValidation, {
   TestFunction,
   Test,
   TestConfig,
+  NextCallback,
+  PanicCallback,
+  TestOptions,
 } from './util/createValidation';
 import printValue from './util/printValue';
 import Ref from './Reference';
@@ -16,52 +19,90 @@ import {
   ValidateOptions,
   TransformFunction,
   Message,
-  Callback,
   InternalOptions,
-  Maybe,
   ExtraParams,
-  AnyObject,
+  ISchema,
+  NestedTestConfig,
+  DefaultThunk,
 } from './types';
 
 import ValidationError from './ValidationError';
-import type { Asserts, Thunk } from './util/types';
 import ReferenceSet from './util/ReferenceSet';
 import Reference from './Reference';
+import isAbsent from './util/isAbsent';
+import type { Flags, Maybe, ResolveFlags, _ } from './util/types';
 import toArray from './util/toArray';
-
-// const UNSET = 'unset' as const;
+import cloneDeep from './util/cloneDeep';
 
 export type SchemaSpec<TDefault> = {
+  coerce: boolean;
   nullable: boolean;
-  presence: 'required' | 'defined' | 'optional';
+  optional: boolean;
   default?: TDefault | (() => TDefault);
   abortEarly?: boolean;
   strip?: boolean;
   strict?: boolean;
   recursive?: boolean;
+  disableStackTrace?: boolean;
   label?: string | undefined;
-  meta?: any;
+  meta?: SchemaMetadata;
 };
 
-export type SchemaOptions<TDefault> = {
-  type?: string;
-  spec?: SchemaSpec<TDefault>;
+export interface CustomSchemaMetadata {}
+
+// If `CustomSchemaMeta` isn't extended with any keys, we'll fall back to a
+// loose Record definition allowing free form usage.
+export type SchemaMetadata = keyof CustomSchemaMetadata extends never
+  ? Record<PropertyKey, any>
+  : CustomSchemaMetadata;
+
+export type SchemaOptions<TType, TDefault> = {
+  type: string;
+  spec?: Partial<SchemaSpec<TDefault>>;
+  check: (value: any) => value is NonNullable<TType>;
 };
 
-export type AnySchema<Type = any, TContext = any, TOut = any> = BaseSchema<
-  Type,
-  TContext,
-  TOut
->;
+export type AnySchema<
+  TType = any,
+  C = any,
+  D = any,
+  F extends Flags = Flags,
+> = Schema<TType, C, D, F>;
 
-export interface CastOptions<TContext = {}> {
+export interface CastOptions<C = {}> {
   parent?: any;
-  context?: TContext;
+  context?: C;
   assert?: boolean;
   stripUnknown?: boolean;
   // XXX: should be private?
   path?: string;
+  resolved?: boolean;
 }
+
+export interface CastOptionalityOptions<C = {}>
+  extends Omit<CastOptions<C>, 'assert'> {
+  /**
+   * Whether or not to throw TypeErrors if casting fails to produce a valid type.
+   * defaults to `true`. The `'ignore-optionality'` options is provided as a migration
+   * path from pre-v1 where `schema.nullable().required()` was allowed. When provided
+   * cast will only throw for values that are the wrong type *not* including `null` and `undefined`
+   */
+  assert: 'ignore-optionality';
+}
+
+export type RunTest = (
+  opts: TestOptions,
+  panic: PanicCallback,
+  next: NextCallback,
+) => void;
+
+export type TestRunOptions = {
+  tests: RunTest[];
+  path?: string | undefined;
+  options: InternalOptions;
+  originalValue: any;
+  value: any;
+};
 
 export interface SchemaRefDescription {
   type: 'ref';
@@ -69,39 +110,52 @@ export interface SchemaRefDescription {
 }
 
 export interface SchemaInnerTypeDescription extends SchemaDescription {
-  innerType?: SchemaFieldDescription;
+  innerType?: SchemaFieldDescription | SchemaFieldDescription[];
 }
 
 export interface SchemaObjectDescription extends SchemaDescription {
   fields: Record<string, SchemaFieldDescription>;
 }
 
+export interface SchemaLazyDescription {
+  type: string;
+  label?: string;
+  meta?: SchemaMetadata;
+}
+
 export type SchemaFieldDescription =
   | SchemaDescription
   | SchemaRefDescription
   | SchemaObjectDescription
-  | SchemaInnerTypeDescription;
+  | SchemaInnerTypeDescription
+  | SchemaLazyDescription;
 
 export interface SchemaDescription {
   type: string;
   label?: string;
-  meta: object;
+  meta?: SchemaMetadata;
   oneOf: unknown[];
   notOneOf: unknown[];
+  default?: unknown;
+  nullable: boolean;
+  optional: boolean;
   tests: Array<{ name?: string; params: ExtraParams | undefined }>;
 }
 
-export default abstract class BaseSchema<
-  TCast = any,
-  TContext = AnyObject,
-  TOutput = any,
-> {
-  declare readonly type: string;
+export default abstract class Schema<
+  TType = any,
+  TContext = any,
+  TDefault = any,
+  TFlags extends Flags = '',
+> implements ISchema<TType, TContext, TFlags, TDefault>
+{
+  readonly type: string;
 
-  declare readonly __inputType: TCast;
-  declare readonly __outputType: TOutput;
-
+  declare readonly __outputType: ResolveFlags<TType, TFlags, TDefault>;
+  declare readonly __context: TContext;
+  declare readonly __flags: TFlags;
   declare readonly __isYupSchema__: boolean;
+  declare readonly __default: TDefault;
 
   readonly deps: readonly string[] = [];
 
@@ -111,18 +165,18 @@ export default abstract class BaseSchema<
   private conditions: Condition[] = [];
 
   private _mutate?: boolean;
-  private _typeError?: Test;
-  private declare _whitelistError?: Test;
-  private declare _blacklistError?: Test;
+
+  private internalTests: Record<string, Test | null> = {};
 
   protected _whitelist = new ReferenceSet();
   protected _blacklist = new ReferenceSet();
 
   protected exclusiveTests: Record<string, boolean> = Object.create(null);
+  protected _typeCheck: (value: any) => value is NonNullable<TType>;
 
   spec: SchemaSpec<any>;
 
-  constructor(options?: SchemaOptions<any>) {
+  constructor(options: SchemaOptions<TType, any>) {
     this.tests = [];
     this.transforms = [];
 
@@ -130,26 +184,29 @@ export default abstract class BaseSchema<
       this.typeError(locale.notType);
     });
 
-    this.type = options?.type || ('mixed' as const);
+    this.type = options.type;
+    this._typeCheck = options.check;
 
     this.spec = {
       strip: false,
       strict: false,
       abortEarly: true,
       recursive: true,
+      disableStackTrace: false,
       nullable: false,
-      presence: 'optional',
+      optional: true,
+      coerce: true,
       ...options?.spec,
     };
+
+    this.withMutation((s) => {
+      s.nonNullable();
+    });
   }
 
   // TODO: remove
   get _type() {
     return this.type;
-  }
-
-  protected _typeCheck(_value: any): _value is NonNullable<TCast> {
-    return true;
   }
 
   clone(spec?: Partial<SchemaSpec<any>>): this {
@@ -164,12 +221,11 @@ export default abstract class BaseSchema<
 
     // @ts-expect-error this is readonly
     next.type = this.type;
+    next._typeCheck = this._typeCheck;
 
-    next._typeError = this._typeError;
-    next._whitelistError = this._whitelistError;
-    next._blacklistError = this._blacklistError;
     next._whitelist = this._whitelist.clone();
     next._blacklist = this._blacklist.clone();
+    next.internalTests = { ...this.internalTests };
     next.exclusiveTests = { ...this.exclusiveTests };
 
     // @ts-expect-error this is readonly
@@ -188,23 +244,15 @@ export default abstract class BaseSchema<
     return next;
   }
 
-  meta(): Record<string, unknown> | undefined;
-  meta(obj: Record<string, unknown>): this;
-  meta(...args: [Record<string, unknown>?]) {
+  meta(): SchemaMetadata | undefined;
+  meta(obj: SchemaMetadata): this;
+  meta(...args: [SchemaMetadata?]) {
     if (args.length === 0) return this.spec.meta;
 
     let next = this.clone();
     next.spec.meta = Object.assign(next.spec.meta || {}, args[0]);
     return next;
   }
-
-  // withContext<TContext extends AnyObject>(): BaseSchema<
-  //   TCast,
-  //   TContext,
-  //   TOutput
-  // > {
-  //   return this as any;
-  // }
 
   withMutation<T>(fn: (schema: this) => T): T {
     let before = this._mutate;
@@ -229,17 +277,11 @@ export default abstract class BaseSchema<
 
     const mergedSpec = { ...base.spec, ...combined.spec };
 
-    // if (combined.spec.nullable === UNSET)
-    //   mergedSpec.nullable = base.spec.nullable;
-
-    // if (combined.spec.presence === UNSET)
-    //   mergedSpec.presence = base.spec.presence;
-
     combined.spec = mergedSpec;
-
-    combined._typeError ||= base._typeError;
-    combined._whitelistError ||= base._whitelistError;
-    combined._blacklistError ||= base._blacklistError;
+    combined.internalTests = {
+      ...base.internalTests,
+      ...combined.internalTests,
+    };
 
     // manually merge the blacklist/whitelist (the other `schema` takes
     // precedence in case of conflicts)
@@ -260,7 +302,7 @@ export default abstract class BaseSchema<
     // the deduping logic is consistent
     combined.withMutation((next) => {
       schema.tests.forEach((fn) => {
-        next.test(fn.OPTIONS);
+        next.test(fn.OPTIONS!);
       });
     });
 
@@ -268,12 +310,17 @@ export default abstract class BaseSchema<
     return combined as any;
   }
 
-  isType(v: any) {
-    if (this.spec.nullable && v === null) return true;
+  isType(v: unknown): v is TType {
+    if (v == null) {
+      if (this.spec.nullable && v === null) return true;
+      if (this.spec.optional && v === undefined) return true;
+      return false;
+    }
+
     return this._typeCheck(v);
   }
 
-  resolve(options: ResolveOptions) {
+  resolve(options: ResolveOptions<TContext>) {
     let schema = this;
 
     if (schema.conditions.length) {
@@ -282,9 +329,10 @@ export default abstract class BaseSchema<
       schema = schema.clone();
       schema.conditions = [];
       schema = conditions.reduce(
-        (schema, condition) => condition.resolve(schema, options),
+        (prevSchema, condition) =>
+          condition.resolve(prevSchema, options) as any,
         schema,
-      ) as this;
+      ) as any as this;
 
       schema = schema.resolve(options);
     }
@@ -292,35 +340,53 @@ export default abstract class BaseSchema<
     return schema;
   }
 
+  protected resolveOptions<T extends InternalOptions<any>>(options: T): T {
+    return {
+      ...options,
+      from: options.from || [],
+      strict: options.strict ?? this.spec.strict,
+      abortEarly: options.abortEarly ?? this.spec.abortEarly,
+      recursive: options.recursive ?? this.spec.recursive,
+      disableStackTrace:
+        options.disableStackTrace ?? this.spec.disableStackTrace,
+    };
+  }
+
   /**
-   *
-   * @param {*} value
-   * @param {Object} options
-   * @param {*=} options.parent
-   * @param {*=} options.context
+   * Run the configured transform pipeline over an input value.
    */
-  cast(value: any, options: CastOptions<TContext> = {}): TCast {
+  cast(value: any, options?: CastOptions<TContext>): this['__outputType'];
+  cast(
+    value: any,
+    options: CastOptionalityOptions<TContext>,
+  ): this['__outputType'] | null | undefined;
+  cast(
+    value: any,
+    options: CastOptions<TContext> | CastOptionalityOptions<TContext> = {},
+  ): this['__outputType'] {
     let resolvedSchema = this.resolve({
       value,
       ...options,
       // parent: options.parent,
       // context: options.context,
     });
+    let allowOptionality = options.assert === 'ignore-optionality';
 
-    let result = resolvedSchema._cast(value, options);
+    let result = resolvedSchema._cast(value, options as any);
 
-    if (
-      value !== undefined &&
-      options.assert !== false &&
-      resolvedSchema.isType(result) !== true
-    ) {
+    if (options.assert !== false && !resolvedSchema.isType(result)) {
+      if (allowOptionality && isAbsent(result)) {
+        return result as any;
+      }
+
       let formattedValue = printValue(value);
       let formattedResult = printValue(result);
+
       throw new TypeError(
         `The value of ${
           options.path || 'field'
         } could not be cast to a value ` +
-          `that satisfies the schema type: "${resolvedSchema._type}". \n\n` +
+          `that satisfies the schema type: "${resolvedSchema.type}". \n\n` +
           `attempted value: ${formattedValue} \n` +
           (formattedResult !== formattedValue
             ? `result of cast: ${formattedResult}`
@@ -331,17 +397,17 @@ export default abstract class BaseSchema<
     return result;
   }
 
-  protected _cast(rawValue: any, _options: CastOptions<TContext>): any {
+  protected _cast(rawValue: any, options: CastOptions<TContext>): any {
     let value =
       rawValue === undefined
         ? rawValue
         : this.transforms.reduce(
-            (value, fn) => fn.call(this, value, rawValue, this),
+            (prevValue, fn) => fn.call(this, prevValue, rawValue, this),
             rawValue,
           );
 
     if (value === undefined) {
-      value = this.getDefault();
+      value = this.getDefault(options);
     }
 
     return value;
@@ -350,90 +416,175 @@ export default abstract class BaseSchema<
   protected _validate(
     _value: any,
     options: InternalOptions<TContext> = {},
-    cb: Callback,
+    panic: (err: Error, value: unknown) => void,
+    next: (err: ValidationError[], value: unknown) => void,
   ): void {
-    let {
-      sync,
-      path,
-      from = [],
-      originalValue = _value,
-      strict = this.spec.strict,
-      abortEarly = this.spec.abortEarly,
-    } = options;
+    let { path, originalValue = _value, strict = this.spec.strict } = options;
 
     let value = _value;
     if (!strict) {
-      // this._validating = true;
       value = this._cast(value, { assert: false, ...options });
-      // this._validating = false;
     }
-    // value is cast, we can check if it meets type requirements
-    let args = {
-      value,
-      path,
-      options,
-      originalValue,
-      schema: this,
-      label: this.spec.label,
-      sync,
-      from,
-    };
 
     let initialTests = [];
+    for (let test of Object.values(this.internalTests)) {
+      if (test) initialTests.push(test);
+    }
 
-    if (this._typeError) initialTests.push(this._typeError);
-
-    let finalTests: any[] = [];
-    if (this._whitelistError) finalTests.push(this._whitelistError);
-    if (this._blacklistError) finalTests.push(this._blacklistError);
-
-    runTests(
+    this.runTests(
       {
-        args,
-        value,
         path,
-        sync,
+        value,
+        originalValue,
+        options,
         tests: initialTests,
-        endEarly: abortEarly,
       },
-      (err) => {
-        if (err) return void cb(err, value);
+      panic,
+      (initialErrors) => {
+        // even if we aren't ending early we can't proceed further if the types aren't correct
+        if (initialErrors.length) {
+          return next(initialErrors, value);
+        }
 
-        runTests(
+        this.runTests(
           {
-            tests: this.tests.concat(finalTests),
-            args,
             path,
-            sync,
             value,
-            endEarly: abortEarly,
+            originalValue,
+            options,
+            tests: this.tests,
           },
-          cb,
+          panic,
+          next,
         );
       },
     );
   }
 
-  validate(
-    value: any,
-    options?: ValidateOptions<TContext>,
-  ): Promise<this['__outputType']>;
-  validate(
-    value: any,
-    options?: ValidateOptions<TContext>,
-    maybeCb?: Callback,
-  ) {
-    let schema = this.resolve({ ...options, value });
+  /**
+   * Executes a set of validations, either schema, produced Tests or a nested
+   * schema validate result.
+   */
+  protected runTests(
+    runOptions: TestRunOptions,
+    panic: (err: Error, value: unknown) => void,
+    next: (errors: ValidationError[], value: unknown) => void,
+  ): void {
+    let fired = false;
+    let { tests, value, originalValue, path, options } = runOptions;
 
-    // callback case is for nested validations
-    return typeof maybeCb === 'function'
-      ? schema._validate(value, options, maybeCb)
-      : new Promise((resolve, reject) =>
-          schema._validate(value, options, (err, value) => {
-            if (err) reject(err);
-            else resolve(value);
-          }),
-        );
+    let panicOnce = (arg: Error) => {
+      if (fired) return;
+      fired = true;
+      panic(arg, value);
+    };
+
+    let nextOnce = (arg: ValidationError[]) => {
+      if (fired) return;
+      fired = true;
+      next(arg, value);
+    };
+
+    let count = tests.length;
+    let nestedErrors = [] as ValidationError[];
+
+    if (!count) return nextOnce([]);
+
+    let args = {
+      value,
+      originalValue,
+      path,
+      options,
+      schema: this,
+    };
+
+    for (let i = 0; i < tests.length; i++) {
+      const test = tests[i];
+
+      test(args!, panicOnce, function finishTestRun(err) {
+        if (err) {
+          Array.isArray(err)
+            ? nestedErrors.push(...err)
+            : nestedErrors.push(err);
+        }
+        if (--count <= 0) {
+          nextOnce(nestedErrors);
+        }
+      });
+    }
+  }
+
+  asNestedTest({
+    key,
+    index,
+    parent,
+    parentPath,
+    originalParent,
+    options,
+  }: NestedTestConfig): RunTest {
+    const k = key ?? index;
+    if (k == null) {
+      throw TypeError('Must include `key` or `index` for nested validations');
+    }
+
+    const isIndex = typeof k === 'number';
+    let value = parent[k];
+
+    const testOptions = {
+      ...options,
+      // Nested validations fields are always strict:
+      //    1. parent isn't strict so the casting will also have cast inner values
+      //    2. parent is strict in which case the nested values weren't cast either
+      strict: true,
+      parent,
+      value,
+      originalValue: originalParent[k],
+      // FIXME: tests depend on `index` being passed around deeply,
+      //   we should not let the options.key/index bleed through
+      key: undefined,
+      // index: undefined,
+      [isIndex ? 'index' : 'key']: k,
+      path:
+        isIndex || k.includes('.')
+          ? `${parentPath || ''}[${isIndex ? k : `"${k}"`}]`
+          : (parentPath ? `${parentPath}.` : '') + key,
+    };
+
+    return (_: any, panic, next) =>
+      this.resolve(testOptions)._validate(value, testOptions, panic, next);
+  }
+
+  validate(
+    value: any,
+    options?: ValidateOptions<TContext>,
+  ): Promise<this['__outputType']> {
+    let schema = this.resolve({ ...options, value });
+    let disableStackTrace =
+      options?.disableStackTrace ?? schema.spec.disableStackTrace;
+
+    return new Promise((resolve, reject) =>
+      schema._validate(
+        value,
+        options,
+        (error, parsed) => {
+          if (ValidationError.isError(error)) error.value = parsed;
+          reject(error);
+        },
+        (errors, validated) => {
+          if (errors.length)
+            reject(
+              new ValidationError(
+                errors!,
+                validated,
+                undefined,
+                undefined,
+                disableStackTrace,
+              ),
+            );
+          else resolve(validated as this['__outputType']);
+        },
+      ),
+    );
   }
 
   validateSync(
@@ -442,11 +593,28 @@ export default abstract class BaseSchema<
   ): this['__outputType'] {
     let schema = this.resolve({ ...options, value });
     let result: any;
+    let disableStackTrace =
+      options?.disableStackTrace ?? schema.spec.disableStackTrace;
 
-    schema._validate(value, { ...options, sync: true }, (err, value) => {
-      if (err) throw err;
-      result = value;
-    });
+    schema._validate(
+      value,
+      { ...options, sync: true },
+      (error, parsed) => {
+        if (ValidationError.isError(error)) error.value = parsed;
+        throw error;
+      },
+      (errors, validated) => {
+        if (errors.length)
+          throw new ValidationError(
+            errors!,
+            value,
+            undefined,
+            undefined,
+            disableStackTrace,
+          );
+        result = validated;
+      },
+    );
 
     return result;
   }
@@ -464,7 +632,7 @@ export default abstract class BaseSchema<
   isValidSync(
     value: any,
     options?: ValidateOptions<TContext>,
-  ): value is Asserts<this> {
+  ): value is this['__outputType'] {
     try {
       this.validateSync(value, options);
       return true;
@@ -474,23 +642,27 @@ export default abstract class BaseSchema<
     }
   }
 
-  protected _getDefault() {
+  protected _getDefault(options?: ResolveOptions<TContext>) {
     let defaultValue = this.spec.default;
 
     if (defaultValue == null) {
       return defaultValue;
     }
+
     return typeof defaultValue === 'function'
-      ? defaultValue.call(this)
+      ? defaultValue.call(this, options)
       : cloneDeep(defaultValue);
   }
 
-  getDefault(options?: ResolveOptions): TCast {
+  getDefault(
+    options?: ResolveOptions<TContext>,
+    // If schema is defaulted we know it's at least not undefined
+  ): TDefault {
     let schema = this.resolve(options || {});
-    return schema._getDefault();
+    return schema._getDefault(options);
   }
 
-  default(def: Thunk<any>): any {
+  default(def: DefaultThunk<any>): any {
     if (arguments.length === 0) {
       return this._getDefault();
     }
@@ -501,53 +673,54 @@ export default abstract class BaseSchema<
   }
 
   strict(isStrict = true) {
-    let next = this.clone();
-    next.spec.strict = isStrict;
+    return this.clone({ strict: isStrict });
+  }
+
+  protected nullability(nullable: boolean, message?: Message<any>) {
+    const next = this.clone({ nullable });
+    next.internalTests.nullable = createValidation({
+      message,
+      name: 'nullable',
+      test(value) {
+        return value === null ? this.schema.spec.nullable : true;
+      },
+    });
     return next;
   }
 
-  protected _isPresent(value: unknown) {
-    return value != null;
-  }
-
-  defined(message = locale.defined): any {
-    return this.test({
+  protected optionality(optional: boolean, message?: Message<any>) {
+    const next = this.clone({ optional });
+    next.internalTests.optionality = createValidation({
       message,
-      name: 'defined',
-      exclusive: true,
+      name: 'optionality',
       test(value) {
-        return value !== undefined;
+        return value === undefined ? this.schema.spec.optional : true;
       },
     });
+    return next;
   }
 
-  required(message = locale.required): any {
-    return this.clone({ presence: 'required' }).withMutation((s) =>
-      s.test({
-        message,
-        name: 'required',
-        exclusive: true,
-        test(value) {
-          return this.schema._isPresent(value);
-        },
-      }),
-    ) as any;
+  optional(): any {
+    return this.optionality(true);
+  }
+  defined(message = locale.defined): any {
+    return this.optionality(false, message);
   }
 
+  nullable(): any {
+    return this.nullability(true);
+  }
+  nonNullable(message = locale.notNull): any {
+    return this.nullability(false, message);
+  }
+
+  required(message: Message<any> = locale.required): any {
+    return this.clone().withMutation((next) =>
+      next.nonNullable(message).defined(message),
+    );
+  }
   notRequired(): any {
-    let next = this.clone({ presence: 'optional' });
-    next.tests = next.tests.filter((test) => test.OPTIONS.name !== 'required');
-    return next as any;
-  }
-
-  nullable(isNullable?: true): any;
-  nullable(isNullable: false): any;
-  nullable(isNullable = true): any {
-    let next = this.clone({
-      nullable: isNullable !== false,
-    });
-
-    return next as any;
+    return this.clone().withMutation((next) => next.nullable().optional());
   }
 
   transform(fn: TransformFunction<this>) {
@@ -569,13 +742,13 @@ export default abstract class BaseSchema<
    * If an exclusive test is added to a schema with non-exclusive tests of the same name
    * the previous tests are removed and further tests of the same name will replace each other.
    */
-  test(options: TestConfig<TCast, TContext>): this;
-  test(test: TestFunction<TCast, TContext>): this;
-  test(name: string, test: TestFunction<TCast, TContext>): this;
+  test(options: TestConfig<this['__outputType'], TContext>): this;
+  test(test: TestFunction<this['__outputType'], TContext>): this;
+  test(name: string, test: TestFunction<this['__outputType'], TContext>): this;
   test(
     name: string,
     message: Message,
-    test: TestFunction<TCast, TContext>,
+    test: TestFunction<this['__outputType'], TContext>,
   ): this;
   test(...args: any[]) {
     let opts: TestConfig;
@@ -613,9 +786,9 @@ export default abstract class BaseSchema<
     if (opts.name) next.exclusiveTests[opts.name] = !!opts.exclusive;
 
     next.tests = next.tests.filter((fn) => {
-      if (fn.OPTIONS.name === opts.name) {
+      if (fn.OPTIONS!.name === opts.name) {
         if (isExclusive) return false;
-        if (fn.OPTIONS.test === validate.OPTIONS.test) return false;
+        if (fn.OPTIONS!.test === validate.OPTIONS.test) return false;
       }
       return true;
     });
@@ -625,11 +798,13 @@ export default abstract class BaseSchema<
     return next;
   }
 
-  when(options: ConditionOptions<this>): this;
-  when(keys: string | string[], options: ConditionOptions<this>): this;
+  when(builder: ConditionBuilder<this>): this;
+  when(keys: string | string[], builder: ConditionBuilder<this>): this;
+  when(options: ConditionConfig<this>): this;
+  when(keys: string | string[], options: ConditionConfig<this>): this;
   when(
-    keys: string | string[] | ConditionOptions<this>,
-    options?: ConditionOptions<this>,
+    keys: string | string[] | ConditionBuilder<this> | ConditionConfig<this>,
+    options?: ConditionBuilder<this> | ConditionConfig<this>,
   ) {
     if (!Array.isArray(keys) && typeof keys !== 'string') {
       options = keys;
@@ -640,11 +815,15 @@ export default abstract class BaseSchema<
     let deps = toArray(keys).map((key) => new Ref(key));
 
     deps.forEach((dep) => {
-      // @ts-ignore
+      // @ts-ignore readonly array
       if (dep.isSibling) next.deps.push(dep.key);
     });
 
-    next.conditions.push(new Condition(deps, options!) as Condition);
+    next.conditions.push(
+      (typeof options === 'function'
+        ? new Condition(deps, options!)
+        : Condition.fromOptions(deps, options!)) as Condition,
+    );
 
     return next;
   }
@@ -652,14 +831,15 @@ export default abstract class BaseSchema<
   typeError(message: Message) {
     let next = this.clone();
 
-    next._typeError = createValidation({
+    next.internalTests.typeError = createValidation({
       message,
       name: 'typeError',
+      skipAbsent: true,
       test(value) {
-        if (value !== undefined && !this.schema.isType(value))
+        if (!this.schema._typeCheck(value))
           return this.createError({
             params: {
-              type: this.schema._type,
+              type: this.schema.type,
             },
           });
         return true;
@@ -668,10 +848,18 @@ export default abstract class BaseSchema<
     return next;
   }
 
-  oneOf<U extends TCast>(
-    enums: Array<Maybe<U> | Reference>,
+  oneOf<U extends TType>(
+    enums: ReadonlyArray<U | Reference>,
+    message?: Message<{ values: any }>,
+  ): this;
+  oneOf(
+    enums: ReadonlyArray<TType | Reference>,
+    message: Message<{ values: any }>,
+  ): any;
+  oneOf<U extends TType>(
+    enums: ReadonlyArray<U | Reference>,
     message = locale.oneOf,
-  ): this {
+  ): any {
     let next = this.clone();
 
     enums.forEach((val) => {
@@ -679,19 +867,19 @@ export default abstract class BaseSchema<
       next._blacklist.delete(val);
     });
 
-    next._whitelistError = createValidation({
+    next.internalTests.whiteList = createValidation({
       message,
       name: 'oneOf',
+      skipAbsent: true,
       test(value) {
-        if (value === undefined) return true;
-        let valids = this.schema._whitelist;
+        let valids = (this.schema as Schema)._whitelist;
         let resolved = valids.resolveAll(this.resolve);
 
         return resolved.includes(value)
           ? true
           : this.createError({
               params: {
-                values: valids.toArray().join(', '),
+                values: Array.from(valids).join(', '),
                 resolved,
               },
             });
@@ -701,8 +889,8 @@ export default abstract class BaseSchema<
     return next;
   }
 
-  notOneOf<U extends TCast>(
-    enums: Array<Maybe<U> | Reference>,
+  notOneOf<U extends TType>(
+    enums: ReadonlyArray<Maybe<U> | Reference>,
     message = locale.notOneOf,
   ): this {
     let next = this.clone();
@@ -711,16 +899,16 @@ export default abstract class BaseSchema<
       next._whitelist.delete(val);
     });
 
-    next._blacklistError = createValidation({
+    next.internalTests.blacklist = createValidation({
       message,
       name: 'notOneOf',
       test(value) {
-        let invalids = this.schema._blacklist;
+        let invalids = (this.schema as Schema)._blacklist;
         let resolved = invalids.resolveAll(this.resolve);
         if (resolved.includes(value))
           return this.createError({
             params: {
-              values: invalids.toArray().join(', '),
+              values: Array.from(invalids).join(', '),
               resolved,
             },
           });
@@ -731,23 +919,31 @@ export default abstract class BaseSchema<
     return next;
   }
 
-  strip(strip = true) {
+  strip(strip = true): any {
     let next = this.clone();
     next.spec.strip = strip;
-    return next;
+    return next as any;
   }
 
-  describe() {
-    const next = this.clone();
-    const { label, meta } = next.spec;
+  /**
+   * Return a serialized description of the schema including validations, flags, types etc.
+   *
+   * @param options Provide any needed context for resolving runtime schema alterations (lazy, when conditions, etc).
+   */
+  describe(options?: ResolveOptions<TContext>) {
+    const next = (options ? this.resolve(options) : this).clone();
+    const { label, meta, optional, nullable } = next.spec;
     const description: SchemaDescription = {
       meta,
       label,
+      optional,
+      nullable,
+      default: next.getDefault(options),
       type: next.type,
       oneOf: next._whitelist.describe(),
       notOneOf: next._blacklist.describe(),
       tests: next.tests
-        .map((fn) => ({ name: fn.OPTIONS.name, params: fn.OPTIONS.params }))
+        .map((fn) => ({ name: fn.OPTIONS!.name, params: fn.OPTIONS!.params }))
         .filter(
           (n, idx, list) => list.findIndex((c) => c.name === n.name) === idx,
         ),
@@ -757,30 +953,35 @@ export default abstract class BaseSchema<
   }
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-export default interface BaseSchema<TCast, TContext, TOutput> {
+export default interface Schema<
+  /* eslint-disable @typescript-eslint/no-unused-vars */
+  TType = any,
+  TContext = any,
+  TDefault = any,
+  TFlags extends Flags = '',
+  /* eslint-enable @typescript-eslint/no-unused-vars */
+> {
   validateAt(
     path: string,
     value: any,
     options?: ValidateOptions<TContext>,
-  ): Promise<TOutput>;
+  ): Promise<any>;
   validateSyncAt(
     path: string,
     value: any,
     options?: ValidateOptions<TContext>,
-  ): TOutput;
-  equals: BaseSchema['oneOf'];
-  is: BaseSchema['oneOf'];
-  not: BaseSchema['notOneOf'];
-  nope: BaseSchema['notOneOf'];
-  optional(): any;
+  ): any;
+  equals: Schema['oneOf'];
+  is: Schema['oneOf'];
+  not: Schema['notOneOf'];
+  nope: Schema['notOneOf'];
 }
 
 // @ts-expect-error
-BaseSchema.prototype.__isYupSchema__ = true;
+Schema.prototype.__isYupSchema__ = true;
 
 for (const method of ['validate', 'validateSync'])
-  BaseSchema.prototype[`${method}At` as 'validateAt' | 'validateSyncAt'] =
+  Schema.prototype[`${method}At` as 'validateAt' | 'validateSyncAt'] =
     function (path: string, value: any, options: ValidateOptions = {}) {
       const { parent, parentPath, schema } = getIn(
         this,
@@ -788,7 +989,7 @@ for (const method of ['validate', 'validateSync'])
         value,
         options.context,
       );
-      return schema[method](parent && parent[parentPath], {
+      return (schema as any)[method](parent && parent[parentPath], {
         ...options,
         parent,
         path,
@@ -796,9 +997,7 @@ for (const method of ['validate', 'validateSync'])
     };
 
 for (const alias of ['equals', 'is'] as const)
-  BaseSchema.prototype[alias] = BaseSchema.prototype.oneOf;
+  Schema.prototype[alias] = Schema.prototype.oneOf;
 
 for (const alias of ['not', 'nope'] as const)
-  BaseSchema.prototype[alias] = BaseSchema.prototype.notOneOf;
-
-BaseSchema.prototype.optional = BaseSchema.prototype.notRequired;
+  Schema.prototype[alias] = Schema.prototype.notOneOf;

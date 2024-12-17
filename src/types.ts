@@ -1,11 +1,37 @@
-import type { AnySchema } from './schema';
-import type Lazy from './Lazy';
+import type { ResolveOptions } from './Condition';
+import type {
+  AnySchema,
+  CastOptionalityOptions,
+  CastOptions,
+  SchemaFieldDescription,
+  SchemaSpec,
+} from './schema';
+import type { Test } from './util/createValidation';
+import type { AnyObject } from './util/objectTypes';
+import type { Flags } from './util/types';
 
-export type AnyObject = Record<string, any>;
+export type { AnyObject, AnySchema };
 
-export type SchemaLike = AnySchema | Lazy<any>;
+export interface ISchema<T, C = any, F extends Flags = any, D = any> {
+  __flags: F;
+  __context: C;
+  __outputType: T;
+  __default: D;
 
-export type Callback<T = any> = (err: Error | null, value?: T) => void;
+  cast(value: any, options?: CastOptions<C>): T;
+  cast(value: any, options: CastOptionalityOptions<C>): T | null | undefined;
+
+  validate(value: any, options?: ValidateOptions<C>): Promise<T>;
+
+  asNestedTest(config: NestedTestConfig): Test;
+
+  describe(options?: ResolveOptions<C>): SchemaFieldDescription;
+  resolve(options: ResolveOptions<C>): ISchema<T, C, F>;
+}
+
+export type DefaultThunk<T, C = any> = T | ((options?: ResolveOptions<C>) => T);
+
+export type InferType<T extends ISchema<any, any>> = T['__outputType'];
 
 export type TransformFunction<T extends AnySchema> = (
   this: T,
@@ -14,9 +40,13 @@ export type TransformFunction<T extends AnySchema> = (
   schema: T,
 ) => any;
 
+export interface Ancester<TContext> {
+  schema: ISchema<any, TContext>;
+  value: any;
+}
 export interface ValidateOptions<TContext = {}> {
   /**
-   * Only validate the input, and skip and coercion or transformation. Default - false
+   * Only validate the input, skipping type casting and transformation. Default - false
    */
   strict?: boolean;
   /**
@@ -32,30 +62,38 @@ export interface ValidateOptions<TContext = {}> {
    */
   recursive?: boolean;
   /**
+   * When true ValidationError instance won't include stack trace information. Default - false
+   */
+  disableStackTrace?: boolean;
+  /**
    * Any context needed for validating schema conditions (see: when())
    */
   context?: TContext;
 }
 
-export interface InternalOptions<TContext = {}>
+export interface InternalOptions<TContext = any>
   extends ValidateOptions<TContext> {
   __validating?: boolean;
   originalValue?: any;
+  index?: number;
+  key?: string;
   parent?: any;
   path?: string;
   sync?: boolean;
-  from?: { schema: AnySchema; value: any }[];
+  from?: Ancester<TContext>[];
 }
 
 export interface MessageParams {
   path: string;
   value: any;
   originalValue: any;
+  originalPath: string;
   label: string;
   type: string;
+  spec: SchemaSpec<any> & Record<string, unknown>;
 }
 
-export type Message<Extra extends Record<string, unknown> = {}> =
+export type Message<Extra extends Record<string, unknown> = any> =
   | string
   | ((params: Extra & MessageParams) => unknown)
   | Record<PropertyKey, unknown>;
@@ -64,8 +102,11 @@ export type ExtraParams = Record<string, unknown>;
 
 export type AnyMessageParams = MessageParams & ExtraParams;
 
-export type Maybe<T> = T | null | undefined;
-
-export type Preserve<T, U> = T extends U ? U : never;
-
-export type Optionals<T> = Extract<T, null | undefined>;
+export interface NestedTestConfig {
+  options: InternalOptions<any>;
+  parent: any;
+  originalParent: any;
+  parentPath: string | undefined;
+  key?: string;
+  index?: number;
+}

@@ -1,16 +1,40 @@
-import { MixedLocale, string as locale } from './locale';
+import { MixedLocale, mixed as mixedLocale, string as locale } from './locale';
 import isAbsent from './util/isAbsent';
 import type Reference from './Reference';
-import type { Message, Maybe, AnyObject } from './types';
-import type { Defined, If, Thunk } from './util/types';
-import BaseSchema from './schema';
+import type { Message, AnyObject, DefaultThunk } from './types';
+import type {
+  Concat,
+  Defined,
+  Flags,
+  NotNull,
+  SetFlag,
+  ToggleDefault,
+  UnsetFlag,
+  Maybe,
+  Optionals,
+} from './util/types';
+import Schema from './schema';
+import { parseDateStruct } from './util/parseIsoDate';
+
+// Taken from HTML spec: https://html.spec.whatwg.org/multipage/input.html#valid-e-mail-address
+let rEmail =
+  // eslint-disable-next-line
+  /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+
+let rUrl =
+  // eslint-disable-next-line
+  /^((https?|ftp):)?\/\/(((([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(%[\da-f]{2})|[!\$&'\(\)\*\+,;=]|:)*@)?(((\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.(\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.(\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.(\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5]))|((([a-z]|\d|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(([a-z]|\d|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])*([a-z]|\d|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])))\.)+(([a-z]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(([a-z]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])*([a-z]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])))\.?)(:\d*)?)(\/((([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(%[\da-f]{2})|[!\$&'\(\)\*\+,;=]|:|@)+(\/(([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(%[\da-f]{2})|[!\$&'\(\)\*\+,;=]|:|@)*)*)?)?(\?((([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(%[\da-f]{2})|[!\$&'\(\)\*\+,;=]|:|@)|[\uE000-\uF8FF]|\/|\?)*)?(\#((([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(%[\da-f]{2})|[!\$&'\(\)\*\+,;=]|:|@)|\/|\?)*)?$/i;
 
 // eslint-disable-next-line
-let rEmail = /^((([a-z]|\d|[!#\$%&'\*\+\-\/=\?\^_`{\|}~]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])+(\.([a-z]|\d|[!#\$%&'\*\+\-\/=\?\^_`{\|}~]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])+)*)|((\x22)((((\x20|\x09)*(\x0d\x0a))?(\x20|\x09)+)?(([\x01-\x08\x0b\x0c\x0e-\x1f\x7f]|\x21|[\x23-\x5b]|[\x5d-\x7e]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(\\([\x01-\x09\x0b\x0c\x0d-\x7f]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF]))))*(((\x20|\x09)*(\x0d\x0a))?(\x20|\x09)+)?(\x22)))@((([a-z]|\d|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(([a-z]|\d|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])*([a-z]|\d|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])))\.)+(([a-z]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(([a-z]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])*([a-z]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])))$/i;
-// eslint-disable-next-line
-let rUrl = /^((https?|ftp):)?\/\/(((([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(%[\da-f]{2})|[!\$&'\(\)\*\+,;=]|:)*@)?(((\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.(\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.(\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.(\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5]))|((([a-z]|\d|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(([a-z]|\d|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])*([a-z]|\d|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])))\.)+(([a-z]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(([a-z]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])*([a-z]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])))\.?)(:\d*)?)(\/((([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(%[\da-f]{2})|[!\$&'\(\)\*\+,;=]|:|@)+(\/(([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(%[\da-f]{2})|[!\$&'\(\)\*\+,;=]|:|@)*)*)?)?(\?((([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(%[\da-f]{2})|[!\$&'\(\)\*\+,;=]|:|@)|[\uE000-\uF8FF]|\/|\?)*)?(\#((([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(%[\da-f]{2})|[!\$&'\(\)\*\+,;=]|:|@)|\/|\?)*)?$/i;
-// eslint-disable-next-line
-let rUUID = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000)$/i;
+let rUUID =
+  /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000)$/i;
+
+let yearMonthDay = '^\\d{4}-\\d{2}-\\d{2}';
+let hourMinuteSecond = '\\d{2}:\\d{2}:\\d{2}';
+let zOrOffset = '(([+-]\\d{2}(:?\\d{2})?)|Z)';
+let rIsoDateTime = new RegExp(
+  `${yearMonthDay}T${hourMinuteSecond}(\\.\\d+)?${zOrOffset}$`,
+);
 
 let isTrimmed = (value: Maybe<string>) =>
   isAbsent(value) || value === value.trim();
@@ -21,28 +45,53 @@ export type MatchOptions = {
   name?: string;
 };
 
+export type DateTimeOptions = {
+  message: Message<{ allowOffset?: boolean; precision?: number }>;
+  /** Allow a time zone offset. False requires UTC 'Z' timezone. (default: false) */
+  allowOffset?: boolean;
+  /** Require a certain sub-second precision on the date. (default: undefined -- any or no sub-second precision) */
+  precision?: number;
+};
+
 let objStringTag = {}.toString();
 
-export function create() {
+function create(): StringSchema;
+function create<
+  T extends string,
+  TContext extends Maybe<AnyObject> = AnyObject,
+>(): StringSchema<T | undefined, TContext>;
+function create() {
   return new StringSchema();
 }
 
+export { create };
+
 export default class StringSchema<
   TType extends Maybe<string> = string | undefined,
-  TContext extends AnyObject = AnyObject,
-  TOut extends TType = TType
-> extends BaseSchema<TType, TContext, TOut> {
+  TContext = AnyObject,
+  TDefault = undefined,
+  TFlags extends Flags = '',
+> extends Schema<TType, TContext, TDefault, TFlags> {
   constructor() {
-    super({ type: 'string' });
+    super({
+      type: 'string',
+      check(value): value is NonNullable<TType> {
+        if (value instanceof String) value = value.valueOf();
+        return typeof value === 'string';
+      },
+    });
 
     this.withMutation(() => {
-      this.transform(function (value) {
-        if (this.isType(value)) return value;
+      this.transform((value, _raw, ctx) => {
+        if (!ctx.spec.coerce || ctx.isType(value)) return value;
+
+        // don't ever convert arrays
         if (Array.isArray(value)) return value;
 
         const strValue =
           value != null && value.toString ? value.toString() : value;
 
+        // no one wants plain objects converted to [Object object]
         if (strValue === objStringTag) return value;
 
         return strValue;
@@ -50,14 +99,22 @@ export default class StringSchema<
     });
   }
 
-  protected _typeCheck(value: any): value is NonNullable<TType> {
-    if (value instanceof String) value = value.valueOf();
-
-    return typeof value === 'string';
+  required(message?: Message<any>) {
+    return super.required(message).withMutation((schema: this) =>
+      schema.test({
+        message: message || mixedLocale.required,
+        name: 'required',
+        skipAbsent: true,
+        test: (value) => !!value!.length,
+      }),
+    );
   }
 
-  protected _isPresent(value: any) {
-    return super._isPresent(value) && !!value.length;
+  notRequired() {
+    return super.notRequired().withMutation((schema: this) => {
+      schema.tests = schema.tests.filter((t) => t.OPTIONS!.name !== 'required');
+      return schema;
+    });
   }
 
   length(
@@ -69,8 +126,9 @@ export default class StringSchema<
       name: 'length',
       exclusive: true,
       params: { length },
+      skipAbsent: true,
       test(value: Maybe<string>) {
-        return isAbsent(value) || value.length === this.resolve(length);
+        return value!.length === this.resolve(length);
       },
     });
   }
@@ -84,8 +142,9 @@ export default class StringSchema<
       name: 'min',
       exclusive: true,
       params: { min },
+      skipAbsent: true,
       test(value: Maybe<string>) {
-        return isAbsent(value) || value.length >= this.resolve(min);
+        return value!.length >= this.resolve(min);
       },
     });
   }
@@ -99,8 +158,9 @@ export default class StringSchema<
       exclusive: true,
       message,
       params: { max },
+      skipAbsent: true,
       test(value: Maybe<string>) {
-        return isAbsent(value) || value.length <= this.resolve(max);
+        return value!.length <= this.resolve(max);
       },
     });
   }
@@ -126,10 +186,9 @@ export default class StringSchema<
       name: name || 'matches',
       message: message || locale.matches,
       params: { regex },
+      skipAbsent: true,
       test: (value: Maybe<string>) =>
-        isAbsent(value) ||
-        (value === '' && excludeEmptyString) ||
-        value.search(regex) !== -1,
+        (value === '' && excludeEmptyString) || value!.search(regex) !== -1,
     });
   }
 
@@ -157,6 +216,54 @@ export default class StringSchema<
     });
   }
 
+  datetime(options?: DateTimeOptions | DateTimeOptions['message']) {
+    let message: DateTimeOptions['message'] = '';
+    let allowOffset: DateTimeOptions['allowOffset'];
+    let precision: DateTimeOptions['precision'];
+
+    if (options) {
+      if (typeof options === 'object') {
+        ({
+          message = '',
+          allowOffset = false,
+          precision = undefined,
+        } = options as DateTimeOptions);
+      } else {
+        message = options;
+      }
+    }
+
+    return this.matches(rIsoDateTime, {
+      name: 'datetime',
+      message: message || locale.datetime,
+      excludeEmptyString: true,
+    })
+      .test({
+        name: 'datetime_offset',
+        message: message || locale.datetime_offset,
+        params: { allowOffset },
+        skipAbsent: true,
+        test: (value: Maybe<string>) => {
+          if (!value || allowOffset) return true;
+          const struct = parseDateStruct(value);
+          if (!struct) return false;
+          return !!struct.z;
+        },
+      })
+      .test({
+        name: 'datetime_precision',
+        message: message || locale.datetime_precision,
+        params: { precision },
+        skipAbsent: true,
+        test: (value: Maybe<string>) => {
+          if (!value || precision == undefined) return true;
+          const struct = parseDateStruct(value);
+          if (!struct) return false;
+          return struct.precision === precision;
+        },
+      });
+  }
+
   //-- transforms --
   ensure(): StringSchema<NonNullable<TType>> {
     return this.default('' as Defined<TType>).transform((val) =>
@@ -179,6 +286,7 @@ export default class StringSchema<
       message,
       name: 'string_case',
       exclusive: true,
+      skipAbsent: true,
       test: (value: Maybe<string>) =>
         isAbsent(value) || value === value.toLowerCase(),
     });
@@ -191,6 +299,7 @@ export default class StringSchema<
       message,
       name: 'string_case',
       exclusive: true,
+      skipAbsent: true,
       test: (value: Maybe<string>) =>
         isAbsent(value) || value === value.toUpperCase(),
     });
@@ -202,80 +311,57 @@ create.prototype = StringSchema.prototype;
 //
 // String Interfaces
 //
-export interface DefinedStringSchema<
-  TType extends Maybe<string>,
-  TContext extends AnyObject = AnyObject
-> extends StringSchema<TType, TContext, Defined<TType>> {
-  default<D extends Maybe<TType>>(
-    def: Thunk<D>,
-  ): If<
-    D,
-    DefinedStringSchema<TType | undefined, TContext>,
-    DefinedStringSchema<Defined<TType>, TContext>
-  >;
-
-  defined(msg?: MixedLocale['defined']): this;
-  required(
-    msg?: MixedLocale['required'],
-  ): RequiredStringSchema<TType, TContext>;
-  optional(): StringSchema<TType, TContext>;
-  notRequired(): StringSchema<TType, TContext>;
-  nullable(isNullable?: true): RequiredStringSchema<TType | null, TContext>;
-  nullable(
-    isNullable: false,
-  ): RequiredStringSchema<Exclude<TType, null>, TContext>;
-}
-
-export interface RequiredStringSchema<
-  TType extends Maybe<string>,
-  TContext extends AnyObject = AnyObject
-> extends StringSchema<TType, TContext, NonNullable<TType>> {
-  default<D extends Maybe<TType>>(
-    def: Thunk<D>,
-  ): If<
-    D,
-    RequiredStringSchema<TType | undefined, TContext>,
-    RequiredStringSchema<Defined<TType>, TContext>
-  >;
-
-  defined(msg?: MixedLocale['defined']): DefinedStringSchema<TType, TContext>;
-  required(
-    msg?: MixedLocale['required'],
-  ): RequiredStringSchema<TType, TContext>;
-  optional(): StringSchema<TType, TContext>;
-  notRequired(): StringSchema<TType, TContext>;
-  nullable(isNullable?: true): RequiredStringSchema<TType | null, TContext>;
-  nullable(
-    isNullable: false,
-  ): RequiredStringSchema<Exclude<TType, null>, TContext>;
-}
 
 export default interface StringSchema<
   TType extends Maybe<string> = string | undefined,
-  TContext extends AnyObject = AnyObject,
-  TOut extends TType = TType
-> extends BaseSchema<TType, TContext, TOut> {
-  concat<TOther extends StringSchema<any, any, any>>(schema: TOther): TOther;
-
+  TContext = AnyObject,
+  TDefault = undefined,
+  TFlags extends Flags = '',
+> extends Schema<TType, TContext, TDefault, TFlags> {
   default<D extends Maybe<TType>>(
-    def: Thunk<D>,
-  ): If<
-    D,
-    StringSchema<TType | undefined, TContext>,
-    StringSchema<Defined<TType>, TContext>
-  >;
+    def: DefaultThunk<D, TContext>,
+  ): StringSchema<TType, TContext, D, ToggleDefault<TFlags, D>>;
 
-  defined(msg?: MixedLocale['defined']): DefinedStringSchema<TType, TContext>;
+  oneOf<U extends TType>(
+    arrayOfValues: ReadonlyArray<U | Reference<U>>,
+    message?: MixedLocale['oneOf'],
+  ): StringSchema<U | Optionals<TType>, TContext, TDefault, TFlags>;
+  oneOf(
+    enums: ReadonlyArray<TType | Reference>,
+    message?: Message<{ values: any }>,
+  ): this;
+
+  concat<UType extends Maybe<string>, UContext, UDefault, UFlags extends Flags>(
+    schema: StringSchema<UType, UContext, UDefault, UFlags>,
+  ): StringSchema<
+    Concat<TType, UType>,
+    TContext & UContext,
+    UDefault,
+    TFlags | UFlags
+  >;
+  concat(schema: this): this;
+
+  defined(
+    msg?: Message,
+  ): StringSchema<Defined<TType>, TContext, TDefault, TFlags>;
+  optional(): StringSchema<TType | undefined, TContext, TDefault, TFlags>;
+
   required(
-    msg?: MixedLocale['required'],
-  ): RequiredStringSchema<TType, TContext>;
-  optional(): StringSchema<TType, TContext>;
-  notRequired(): StringSchema<TType, TContext>;
+    msg?: Message,
+  ): StringSchema<NonNullable<TType>, TContext, TDefault, TFlags>;
+  notRequired(): StringSchema<Maybe<TType>, TContext, TDefault, TFlags>;
 
-  nullable(isNullable?: true): StringSchema<TType | null, TContext>;
-  nullable(isNullable: false): StringSchema<Exclude<TType, null>, TContext>;
-  withContext<TNextContext extends TContext>(): StringSchema<
-    Exclude<TType, null>,
-    TNextContext
-  >;
+  nullable(
+    msg?: Message,
+  ): StringSchema<TType | null, TContext, TDefault, TFlags>;
+  nonNullable(
+    msg?: Message
+  ): StringSchema<NotNull<TType>, TContext, TDefault, TFlags>;
+
+  strip(
+    enabled: false,
+  ): StringSchema<TType, TContext, TDefault, UnsetFlag<TFlags, 's'>>;
+  strip(
+    enabled?: true,
+  ): StringSchema<TType, TContext, TDefault, SetFlag<TFlags, 's'>>;
 }
